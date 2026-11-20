@@ -31,6 +31,7 @@ import random
 import re
 import sys
 import time
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -257,13 +258,20 @@ def send_song_request(
             f"{title} | ID: {video_id}"
         )
         return {"ok": False, "status": exc.code, "video_id": video_id}
+    except (TimeoutError, socket.timeout) as exc:
+        elapsed = time.monotonic() - start
+        print(
+            f"[#{index:03d}] {now} | TIMEOUT in {elapsed:.2f}s | "
+            f"{title} | ID: {video_id} | {exc}"
+        )
+        return {"ok": False, "status": None, "error": "timeout", "video_id": video_id}
     except Exception as exc:
         elapsed = time.monotonic() - start
         print(
             f"[#{index:03d}] {now} | ERROR in {elapsed:.2f}s | "
             f"{title} | ID: {video_id} | {exc}"
         )
-        return {"ok": False, "status": None, "video_id": video_id}
+        return {"ok": False, "status": None, "error": "other", "video_id": video_id}
 
 
 def parse_args() -> argparse.Namespace:
@@ -327,6 +335,7 @@ def main() -> None:
     sent_count = 0
     next_tick = time.monotonic()
 
+    futures: List[concurrent.futures.Future] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         try:
             while True:
@@ -370,9 +379,16 @@ def main() -> None:
                     save_played_ids(HISTORY_FILE, played_ids)
 
                 sent_count += 1
-                executor.submit(send_song_request, sent_count, video_id, title, args.dry_run)
+                # Submit and schedule the next song without waiting for this response.
+                # HTTP 503/timeouts are not retried; the next unique song is used.
+                future = executor.submit(send_song_request, sent_count, video_id, title, args.dry_run)
+                futures.append(future)
+                print(
+                    f"[SENT] #{sent_count:03d} request dispatched | "
+                    f"{title} | next request in {args.interval:.1f}s"
+                )
 
-                # Drift-free 3.6s scheduling
+                # Drift-free scheduling, independent of API response time.
                 next_tick += args.interval
                 sleep_for = next_tick - time.monotonic()
                 if sleep_for > 0:
@@ -381,8 +397,35 @@ def main() -> None:
                     next_tick = time.monotonic()
 
         except KeyboardInterrupt:
-            print(f"\n[STOPPED] User ne script band ki. Total unique songs requested: {sent_count}")
-            sys.exit(0)
+            print(f"\n[STOPPED] User ne script band ki. Pending requests finish hone ka wait hoga.")
+
+    success_count = 0
+    http_503_count = 0
+    timeout_count = 0
+    other_failed_count = 0
+    for future in concurrent.futures.as_completed(futures):
+        try:
+            result = future.result()
+        except Exception:
+            other_failed_count += 1
+            continue
+        if result.get("ok"):
+            success_count += 1
+        elif result.get("status") == 503:
+            http_503_count += 1
+        elif result.get("error") == "timeout":
+            timeout_count += 1
+        else:
+            other_failed_count += 1
+
+    print("\n" + "=" * 60)
+    print("REQUEST SUMMARY")
+    print(f"Dispatched : {sent_count}")
+    print(f"Successful : {success_count}")
+    print(f"HTTP 503   : {http_503_count}")
+    print(f"Timeouts   : {timeout_count}")
+    print(f"Other fails: {other_failed_count}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
